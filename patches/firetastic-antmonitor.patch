@@ -1,0 +1,975 @@
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/DumperFileStateManager.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/DumperFileStateManager.java
+index 369de8d..ab7df3e 100644
+--- a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/DumperFileStateManager.java
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/DumperFileStateManager.java
+@@ -37,8 +37,8 @@ class DumperFileStateManager {
+ 
+     private Pair<PcapngFile, PcapngFile> files;
+ 
+-    // Split file when size reaches 10mb
+-    private final long maxFileSize = 10485760;
++    // Split file when size reaches 20mb
++    private final long maxFileSize = 20971520;
+ 
+     public DumperFileStateManager(Context context) {
+         mContext = context;
+@@ -62,16 +62,23 @@ class DumperFileStateManager {
+ 
+         // If file is too big, create a new file set
+         if (file.getSectionLength() > maxFileSize) {
+-            endFiles();
++            return startNewFiles(type);
++        }
+ 
+-            // Create a new file set
+-            Pair<PcapngFile, PcapngFile> files = TrafficLogFiles.createNewActiveFileSet(mContext);
+-            setFiles(files);
++        return file;
++    }
+ 
+-            return getFileForType(type);
++    public synchronized PcapngFile startNewFiles(TrafficType type) {
++        PcapngFile file = getFileForType(type);
++        if (file != null) {
++            endFiles();
+         }
++    
++        // Create a new file set
++        Pair<PcapngFile, PcapngFile> files = TrafficLogFiles.createNewActiveFileSet(mContext);
++            setFiles(files);
+ 
+-        return file;
++        return getFileForType(type);
+     }
+ 
+     /** Convenience method to get the file for the specified {@link TrafficType}
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketConsumer.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketConsumer.java
+index 5595a26..378808f 100644
+--- a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketConsumer.java
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketConsumer.java
+@@ -125,16 +125,19 @@ public class PacketConsumer {
+      * @param packet The packet (and its associated metadata) that is to be written to file.
+      * @param comment a {@link String} containing metadata/comments such as the name of the app
+      *                responsible for the packet.
++     * @param startNewLog whether we should start a new log file or not
+      * @throws IllegalStateException if this {@link PacketConsumer} was created without a
+      * {@link TrafficType} or without a user id.
+      */
+-    protected void log(PacketDumpInfo packet, String comment) {
++    protected void log(PacketDumpInfo packet, String comment, boolean startNewLog) {
+         if (mTrafficType == null)
+             throw new IllegalStateException("Cannot log packets when traffic type was not set.");
+ 
+         if (TrafficLogFiles.getUserID() == null)
+             throw new IllegalStateException("Cannot log packets when no user id was specified.");
+ 
+-        PacketProcessor.getInstance(mContext).log(packet, comment, mTrafficType);
++        PacketProcessor.getInstance(mContext).log(packet, comment, mTrafficType, startNewLog);
++
+     }
++
+ }
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketLogQueue.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketLogQueue.java
+index 5569ed6..1cfa462 100644
+--- a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketLogQueue.java
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketLogQueue.java
+@@ -29,7 +29,7 @@ import edu.uci.calit2.antmonitor.lib.util.PacketDumpInfo;
+  * @author Simon Langhoff, Janus Varmarken
+  */
+ public class PacketLogQueue {
+-    private ArrayBlockingQueue<PacketDumpInfo> queue = new ArrayBlockingQueue<PacketDumpInfo>(35000);
++    private ArrayBlockingQueue<PacketDumpInfo> queue = new ArrayBlockingQueue<PacketDumpInfo>(65000);
+ 
+     private final long timeout = 1000l;
+ 
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketProcessor.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketProcessor.java
+index 04ed947..edcd0f9 100644
+--- a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketProcessor.java
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/PacketProcessor.java
+@@ -177,12 +177,18 @@ public class PacketProcessor {
+      * @param comment comment to include when logging the packet. Passing {@code null} will log the
+      *                packet without annotations.
+      * @param trafficDirection indicating whether this packet is incoming or outgoing.
++     * @param startNewLog indicating whether we should start new log files.
+      */
+     public synchronized void log(PacketDumpInfo packet, String comment,
+-                                 TrafficType trafficDirection) {
++                                 TrafficType trafficDirection, boolean startNewLog) {
+         // Check if we need to init first
+-        if (mStateManager == null)
++        if (mStateManager == null) {
+             prepareForLogging();
++        }
++        else if (startNewLog) {
++            mStateManager.startNewFiles(trafficDirection);
++        }
++            
+ 
+         if(comment == null)
+             comment = "";
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/TrafficLogFiles.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/TrafficLogFiles.java
+index 10cf317..4edc022 100644
+--- a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/TrafficLogFiles.java
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/logging/TrafficLogFiles.java
+@@ -71,6 +71,8 @@ public class TrafficLogFiles {
+     private static long sessionID = 0;
+ 
+     private static String userID;
++    
++    private static String packageNameSanitized = "";
+ 
+ 
+     /**
+@@ -99,6 +101,13 @@ public class TrafficLogFiles {
+ 
+     static synchronized void setUserID(String id) { userID = id; }
+ 
++    public static synchronized void setPackageName(String packageName) {
++        // sanitize the package name
++        if (packageName != null) {
++            packageNameSanitized = packageName.replaceAll("[^a-zA-Z0-9]+","");
++        }
++    }
++
+     /**
+      * Factory for creating a new set of stream files of the PCAPNG format, i.e. files to which
+      * current network traffic can be written (streamed).
+@@ -113,8 +122,13 @@ public class TrafficLogFiles {
+         File folder = new File(LOG_DIR);
+         folder.mkdirs();
+ 
++        String baseFilePathName = folder.getAbsolutePath() + "/";
++        if (packageNameSanitized != null && !packageNameSanitized.isEmpty()) {
++            baseFilePathName += packageNameSanitized + "/";
++        }
++
+         // Name file according to timestamp.
+-        String baseFilePathName = folder.getAbsolutePath() + "/" +
++        baseFilePathName += folder.getAbsolutePath() + "/" +
+                 ACTIVE_LOG_FILE_PREFIX + "_" +
+                 cal.get(Calendar.DAY_OF_MONTH) + "-" +
+                 // January has value = 0. Add 1 to enhance readability.
+@@ -125,6 +139,8 @@ public class TrafficLogFiles {
+                 cal.get(Calendar.SECOND) + "-" +
+                 cal.get(Calendar.MILLISECOND);
+ 
++        Log.i(TAG, "Starting new log files with: " + baseFilePathName);
++
+         PcapngFile incFile = createFile(baseFilePathName +
+                 PacketProcessor.TrafficType.INCOMING_PACKETS.getTrafficTypeString() +
+                 ".pcapng", context);
+diff --git a/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/vpn/VpnControllerNoBinding.java b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/vpn/VpnControllerNoBinding.java
+new file mode 100644
+index 0000000..c133d0a
+--- /dev/null
++++ b/antmonitorlib/src/main/java/edu/uci/calit2/antmonitor/lib/vpn/VpnControllerNoBinding.java
+@@ -0,0 +1,199 @@
++/*
++ *  This file is part of AntMonitor <https://athinagroup.eng.uci.edu/projects/antmonitor/>.
++ *  Copyright (C) 2018 Anastasia Shuba and the UCI Networking Group
++ *  <https://athinagroup.eng.uci.edu>, University of California, Irvine.
++ *
++ *  AntMonitor is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  AntMonitor is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with AntMonitor. If not, see <http://www.gnu.org/licenses/>.
++ */
++package edu.uci.calit2.antmonitor.lib.vpn;
++
++import android.app.Activity;
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++
++
++import java.io.IOException;
++import java.io.InputStream;
++
++import edu.uci.calit2.antmonitor.lib.logging.PacketConsumer;
++
++/**
++ * A helper class meant to be used by Activities that are responsible for starting/stopping
++ * the VPN service.
++ *
++ * @author Anastasia Shuba
++ */
++public class VpnControllerNoBinding {
++    /** Use this with {@link Activity#startActivityForResult}
++     * to ask the user for VPN rights */
++    public static final int REQUEST_VPN_RIGHTS = 1;
++
++    /** Use this with {@link Activity#startActivityForResult}
++     * to ask the user to install a root certificate, needed for SSL bumping. */
++    public static final int REQUEST_INSTALL_CERT = 2;
++
++    private static final String TAG = VpnControllerNoBinding.class.getSimpleName();
++
++    private static VpnStateReceiver mVpnStateReceiver;
++
++    private VpnClient.VpnClientBinder mService = null;
++
++    private static Context mActivContext;
++
++    private static VpnControllerNoBinding vpnController = new VpnControllerNoBinding();
++
++    private VpnControllerNoBinding() {}
++
++    /** Initializes the controller
++     * @param context must be a {@link Context} instance
++     * @return an instance of the {@link VpnControllerNoBinding}
++     * @throws ClassCastException if {@code activity} is not a {@link Context} instance
++     */
++    public static VpnControllerNoBinding getInstance(Context context) throws ClassCastException {
++        if (context == null)
++            throw new IllegalArgumentException("context cannot be null.");
++
++        mActivContext = context;
++
++        mVpnStateReceiver = new VpnStateReceiver();
++
++        return vpnController;
++    }
++
++
++    /**
++     * Attempts to start the VPN connection. Note that in order for this attempt to be successful,
++     * you must be bound and you must have obtained VPN rights from the user.
++     *
++     * If any of the parameters are null, the default filter/consumer will be used.
++     * @param incFilter this {@link PacketFilter} will be used to filter real-time incoming traffic
++     * @param outFilter this {@link PacketFilter} will be used to filter real-time outgoing traffic
++     * @param incPacketConsumer this {@link PacketConsumer}'s {@code consumePacket()} method will
++     *                          be called when there is an incoming packet available for
++     *                          off-line processing
++     * @param outPacketConsumer this {@link PacketConsumer}'s {@code consumePacket()} method will
++     *                          be called when there is an outgoing packet available for
++     *                          off-line processing
++     */
++    public void connect(IncPacketFilter incFilter, OutPacketFilter outFilter, PacketConsumer
++            incPacketConsumer, PacketConsumer outPacketConsumer) {
++        // First: start the background VPN service so that it will stay alive even if we unbind.
++        Intent intent = new Intent(mActivContext, VpnClient.class);
++        mActivContext.startService(intent);
++        // Then start connection procedure.
++        mService.connectToVpn(incFilter, outFilter, incPacketConsumer, outPacketConsumer);
++    }
++
++    /**
++     * Same as {@link #connect(IncPacketFilter, OutPacketFilter, PacketConsumer, PacketConsumer)}, except
++     * it does not require binding (see {@link #bind()}). Use this method if you do not wish to
++     * receive updates about the VPN state. Note that an unsuccessful connection from this method
++     * will trigger automatic re-tries. This method is useful for re-connecting upon a device
++     * boot. Use this method with caution as users may not want automatic re-connecting.
++     *
++     * @param context typically an {@link Activity} or a {@link android.app.Service}.
++     * @param incFilter this {@link PacketFilter} will be used to filter real-time incoming traffic
++     * @param outFilter this {@link PacketFilter} will be used to filter real-time outgoing traffic
++     * @param incPacketConsumer this {@link PacketConsumer}'s {@code consumePacket()} method will
++     *                          be called when there is an incoming packet available for
++     *                          off-line processing
++     * @param outPacketConsumer this {@link PacketConsumer}'s {@code consumePacket()} method will
++     *                          be called when there is an outgoing packet available for
++     *                          off-line processing
++     */
++    public static void connectInBackground(Context context, IncPacketFilter incFilter,
++                                           OutPacketFilter outFilter,
++                                           PacketConsumer incPacketConsumer,
++                                           PacketConsumer outPacketConsumer) {
++
++        VpnClient.prepareVPNconnection(incFilter, outFilter, incPacketConsumer, outPacketConsumer);
++        Intent intent = new Intent(context, VpnClient.class);
++        // Specify that the servic should immediately establish the connection
++        intent.putExtra(VpnClient.EXTRA_CONNECT_ON_STARTUP, true);
++        context.startService(intent);
++    }
++
++
++    /** Disconnects the VPN if we are connected. Otherwise, nothing happens. */
++    public void disconnect() {
++        if (mService != null)
++            mService.disconnectVpn();
++    }
++
++    /**
++     * @param context used to check if certificate was installed
++     * @param enabled pass {@code true} to enable SSL bumping, and
++     * pass {@code false} otherwise
++     * @throws IllegalStateException if certificate is not installed and {@code enabled} is
++     * true
++     */
++    public static void setSSLBumpingEnabled(Context context, boolean enabled)
++            throws IllegalStateException {
++        ForwarderManager.setSSLBumpingEnabled(context, enabled);
++    }
++
++    /** @return {@code true} if SSL bumping is currently enabled, and {@code false} otherwise */
++    public static boolean getSSLBumpingEnabled() {
++        return ForwarderManager.getSSLBumpingEnabled();
++    }
++
++    /**
++     * Add domain/app combos in the provided stream to a list of domain/apps that should not
++     * attempt TLS interception. The provided JSON stream should be of the following format: <br>
++            <pre>
++             {
++                 "pinnedCombinations": [
++                     {
++                         "packageName": "com.android.providers.downloads",
++                         "domains": ["*.google.com"]
++                     },
++
++                     {
++                         "packageName": "org.mozilla.firefox",
++                         "domains": ["*.media.mozilla.com", "twitter.com"]
++                     }
++                 ]
++             }
++            </pre>
++     Invoke this function every time you connect to VPN.
++     * @param jsonStream the stream to read domain/app combos from. Callers must close the stream.
++     * @throws IOException
++     */
++    public static void addPinnedDomains(InputStream jsonStream) throws IOException {
++        TLSProxyServer.addPinnedCNs(jsonStream);
++    }
++
++    /** Convenience method for checking Internet connectivity
++     * @return {@code true} if there is Internet connectivity, and {@code false} otherwise */
++    public boolean isConnectedToInternet() {
++        ConnectionManager manager = new ConnectionManager(mActivContext);
++        return manager.isConnectedToInternet();
++    }
++
++
++    private static class VpnStateReceiver extends BroadcastReceiver {
++
++        @Override
++        public void onReceive(Context context, Intent intent) {
++            if(intent == null)
++                return;
++
++            if(VpnClient.VPN_STATE_BROADCAST_ACTION.equals(intent.getAction())) {
++                VpnState vpnState = (VpnState) intent.getSerializableExtra(
++                                                VpnClient.VPN_STATE_BROADCAST_STATE_KEY);
++            }
++        }
++    }
++}
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 043695b..944f180 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -54,7 +54,9 @@
+         Make AntMonitorLauncherActivity the launcher activity if we want to start off deciding whether gettingstartedactivity or antmonitormainactivity should start
+         -->
+         <activity android:name=".client.android.activity.AntMonitorLauncherActivity"
+-            android:theme="@style/NoActionBar">
++            android:theme="@style/NoActionBar"
++            android:excludeFromRecents="true"
++            android:launchMode="singleTask">            
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+@@ -63,6 +65,10 @@
+                 <action android:name="edu.uci.calit2.anteater.ACTION.NOTIFICATION"/>
+                 <category android:name="android.intent.category.DEFAULT"/>
+             </intent-filter>
++            <intent-filter>
++                <action android:name="edu.uci.calit2.anteater.client.android.vpn.STARTBACKGROUND" />
++                <action android:name="edu.uci.calit2.anteater.client.android.vpn.STOPBACKGROUND" />
++            </intent-filter>
+         </activity>
+ 
+         <!--
+@@ -89,6 +95,8 @@
+             <!-- Attempts to reestablish VPN on reboot -->
+             <intent-filter>
+                 <action android:name="android.intent.action.BOOT_COMPLETED" />
++                <action android:name="edu.uci.calit2.anteater.client.android.vpn.STARTBACKGROUND" />
++                <action android:name="edu.uci.calit2.anteater.client.android.vpn.STOPBACKGROUND" />          
+             </intent-filter>
+         </receiver>
+         <receiver android:name=".client.android.analysis.ActionReceiver">
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/AntMonitorMainActivity.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/AntMonitorMainActivity.java
+index a3b5c88..ebb93e9 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/AntMonitorMainActivity.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/AntMonitorMainActivity.java
+@@ -31,6 +31,7 @@ import android.support.v4.widget.DrawerLayout;
+ import android.support.v7.app.ActionBarDrawerToggle;
+ import android.support.v7.app.AppCompatActivity;
+ import android.support.v7.widget.Toolbar;
++import android.util.Log;
+ import android.view.Menu;
+ import android.view.MenuItem;
+ import android.view.MotionEvent;
+@@ -326,8 +327,29 @@ public class AntMonitorMainActivity extends AppCompatActivity
+         } else {
+             updateAntmonitorSwitch(!isConnecting, isConnected);
+         }
++
++        Log.i(TAG, "onVpnStateChanged Called VPN: " + getIntent().getAction());
++
++        if (VpnStarterActivity.INTENT__START_VPN_BACKGROUND.equals(getIntent().getAction()) && !isConnected && !isConnecting) {
++            Log.i(TAG, "Got intent to START VPN");
++
++            if (!antMonitorSwitch.isChecked()) {
++                antMonitorSwitch.performClick();
++            }
++        } else if (VpnStarterActivity.INTENT__STOP_VPN_BACKGROUND.equals(getIntent().getAction()) && isConnected && !isConnecting) {
++            Log.i(TAG, "Got intent to STOP VPN");
++            if (antMonitorSwitch.isChecked()) {
++                antMonitorSwitch.performClick();
++            }
++        }
+     }
+ 
++    @Override
++    protected void onNewIntent (Intent intent) {
++        Log.i(TAG, "VPN : setting new intent to : " + intent.getAction());
++        setIntent(intent);
++     }
++
+     @Override
+     protected void onStart() {
+         super.onStart();
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/VpnStarterActivity.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/VpnStarterActivity.java
+index dea3c1f..01d5f80 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/VpnStarterActivity.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/VpnStarterActivity.java
+@@ -27,6 +27,7 @@ import edu.uci.calit2.antmonitor.lib.vpn.IncPacketFilter;
+ import edu.uci.calit2.antmonitor.lib.vpn.OutPacketFilter;
+ import edu.uci.calit2.antmonitor.lib.vpn.VpnClient;
+ import edu.uci.calit2.antmonitor.lib.vpn.VpnController;
++import edu.uci.calit2.antmonitor.lib.vpn.VpnControllerNoBinding;
+ 
+ 
+ /**
+@@ -65,11 +66,23 @@ public class VpnStarterActivity extends Activity {
+      */
+     private final int mPrepareVpnRequestCode = 42;
+ 
++    public final static String INTENT__START_VPN_BACKGROUND = "edu.uci.calit2.anteater.client.android.vpn.STARTBACKGROUND";
++    public final static String INTENT__STOP_VPN_BACKGROUND = "edu.uci.calit2.anteater.client.android.vpn.STOPBACKGROUND";
++
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+         Log.d(mClassTag, this.getClass().getSimpleName() + " started");
++        handleIntents();
++    }
++
++    protected void handleIntents() {
++        Log.i(mClassTag, "Defaulting to START VPN");
++        // default to always starting VPN
++        startVPN();
++    }
+ 
++    private void startVPN() {
+         Intent intent = android.net.VpnService.prepare(this);
+         if (intent != null) {
+             Log.d(mClassTag, "Requesting VPN rights via startActivityForResult...");
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/uielements/ApplicationLogListAdapter.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/uielements/ApplicationLogListAdapter.java
+index bba1664..02c7943 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/uielements/ApplicationLogListAdapter.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/activity/uielements/ApplicationLogListAdapter.java
+@@ -85,6 +85,9 @@ public class ApplicationLogListAdapter extends ArrayAdapter<ApplicationInfo> {
+             }
+         });
+ 
++        // force each applicaton to be logged
++        viewHolder.applicationSwitch.setChecked(true);
++
+         return convertView;
+     }
+ 
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/AMPacketConsumer.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/AMPacketConsumer.java
+index 7ed4b60..ae1b531 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/AMPacketConsumer.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/AMPacketConsumer.java
+@@ -24,7 +24,9 @@ import edu.uci.calit2.anteater.client.android.util.OpenAppDetails;
+ import edu.uci.calit2.anteater.client.android.util.PreferenceTags;
+ import edu.uci.calit2.antmonitor.lib.logging.ConnectionValue;
+ import edu.uci.calit2.antmonitor.lib.logging.PacketConsumer;
++import edu.uci.calit2.antmonitor.lib.logging.PacketProcessor;
+ import edu.uci.calit2.antmonitor.lib.logging.PacketProcessor.TrafficType;
++import edu.uci.calit2.antmonitor.lib.logging.TrafficLogFiles;
+ import edu.uci.calit2.antmonitor.lib.util.IpDatagram;
+ import edu.uci.calit2.antmonitor.lib.util.PacketDumpInfo;
+ 
+@@ -40,6 +42,7 @@ public class AMPacketConsumer extends PacketConsumer {
+ 
+     private final ApplicationFilter appFilter;
+ 
++    private String currentForegroundApp = null;
+ 
+     public AMPacketConsumer(Context context, TrafficType trafficType, String userID) {
+         super(context, trafficType, userID);
+@@ -86,19 +89,28 @@ public class AMPacketConsumer extends PacketConsumer {
+ 
+         ConnectionValue cv = mapPacketToApp(packetDumpInfo);
+         if (!(cv.getAppName().startsWith(ConnectionValue.MappingErrors.PREFIX))) {
++            /* Comment this out if you want to log specific apps only
+             // Log app only if user agreed to
+             if (!appFilter.getFilteredApps().contains(cv.getAppName())) {
+                 return;
+             }
++            */
++
++            // Ignore droidbot app only. Everything else we log.
++            if (appFilter.getFilteredApps().contains("doidbotapp")) {
++                return;
++            }
+         }
+ 
++        boolean startNewLogFile = false;
++
+         String comment = "";
+         comment = cv.getAppName();
+         if (cv.getVersionNum() != null) {
+             comment += "#" + cv.getVersionNum();
+         }
+ 
+-        log(packetDumpInfo, comment);
++        log(packetDumpInfo, comment, startNewLogFile);
+     }
+ 
+     public static void setPacketLogging(int contribution_prefs) {
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ActionReceiver.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ActionReceiver.java
+index 6de4d01..84085f3 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ActionReceiver.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ActionReceiver.java
+@@ -37,7 +37,7 @@ public class ActionReceiver extends BroadcastReceiver {
+     // skip means the user provided no input, so we do nothing
+     public static final String ACTION_SKIP = ActionReceiver.class.getPackage().getName() + ".SKIP";
+ 
+-    public static final String ACTION_DEFAULT = ACTION_HASH;
++    public static final String ACTION_DEFAULT = ACTION_ALLOW;
+ 
+     public static final String APP = "APP";
+     public static final String STRING = "STRING";
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ApplicationFilter.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ApplicationFilter.java
+index 996e73b..5ca86eb 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ApplicationFilter.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/analysis/ApplicationFilter.java
+@@ -23,6 +23,7 @@ import android.content.pm.PackageManager;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -43,6 +44,9 @@ public class ApplicationFilter{
+     // Concurrent HashMap.
+     Set<String> filteredApps = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+ 
++    // system application names
++    Set<String> systemApps = new HashSet<>();
++
+     private Context mContext;
+ 
+     /**
+@@ -156,6 +160,9 @@ public class ApplicationFilter{
+ 
+                 // Add each system app to filter.
+                 addToFilter(appInfo.packageName);
++                // keep track of system app name
++                systemApps.add(appInfo.packageName);
++
+             }
+         }
+ 
+@@ -204,4 +211,14 @@ public class ApplicationFilter{
+     public boolean isSystemPackage(ApplicationInfo applicationInfo) {
+         return (((applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) || (applicationInfo.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0);
+     }
++
++    /**
++     * Check if package name is a systema app.
++     * @param packageName The package name to check.
++     * @return true package name belongs to system application.
++     */
++    public boolean isSystemPackage(String packageName) {
++        return systemApps.contains(packageName);
++    }  
++
+ }
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/device/DeviceBootListener.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/device/DeviceBootListener.java
+index 10d3c1e..3eb7638 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/device/DeviceBootListener.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/device/DeviceBootListener.java
+@@ -22,6 +22,7 @@ import android.content.Context;
+ import android.content.Intent;
+ import android.util.Log;
+ 
++import edu.uci.calit2.anteater.client.android.activity.AntMonitorMainActivity;
+ import edu.uci.calit2.anteater.client.android.activity.VpnStarterActivity;
+ 
+ /**
+@@ -40,12 +41,28 @@ public class DeviceBootListener extends BroadcastReceiver {
+     @Override
+     public void onReceive(Context context, Intent intent) {
+         if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+-            Log.d(mClassTag, "Boot completed, attempting to restart VPN.");
++            /*Log.d(mClassTag, "Boot completed, attempting to restart VPN.");
+ 
+             // Launch invisible activity (only way to request VPN rights)
+             Intent vpnStartRequest = new Intent(context, VpnStarterActivity.class);
+             vpnStartRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++            context.startActivity(vpnStartRequest);*/
++        } else if(VpnStarterActivity.INTENT__START_VPN_BACKGROUND.equals(intent.getAction())) {
++            Log.i(mClassTag, "External source requesting to START VPN.");
++
++            // Launch invisible activity (only way to request VPN rights)
++            Intent vpnStartRequest = new Intent(context, AntMonitorMainActivity.class);
++            vpnStartRequest.setAction(VpnStarterActivity.INTENT__START_VPN_BACKGROUND);
++            vpnStartRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+             context.startActivity(vpnStartRequest);
++        } else if(VpnStarterActivity.INTENT__STOP_VPN_BACKGROUND.equals(intent.getAction())) {
++            Log.i(mClassTag, "External source requesting to STOP VPN.");
++
++            // Launch invisible activity (only way to request VPN rights)
++            Intent vpnStopRequest = new Intent(context, AntMonitorMainActivity.class);
++            vpnStopRequest.setAction(VpnStarterActivity.INTENT__STOP_VPN_BACKGROUND);
++            vpnStopRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++            context.startActivity(vpnStopRequest);
+         }
+     }
+ }
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ApplicationsForLoggingFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ApplicationsForLoggingFragment.java
+index dc55d48..5894f48 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ApplicationsForLoggingFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ApplicationsForLoggingFragment.java
+@@ -122,6 +122,8 @@ public class ApplicationsForLoggingFragment extends Fragment {
+                 }
+             }
+         });
++        // default to true for system apps
++        systemAppsSwitch.setChecked(true);
+         return view;
+     }
+ 
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeLogsFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeLogsFragment.java
+index 390c26b..075df35 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeLogsFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeLogsFragment.java
+@@ -33,6 +33,7 @@ import android.view.MenuInflater;
+ import android.view.MenuItem;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.widget.Button;
+ import android.widget.ListView;
+ import android.widget.TextView;
+ 
+@@ -169,7 +170,7 @@ public class ContributeLogsFragment extends Fragment implements LoaderManager.Lo
+ 
+         ListView historyListView = (ListView) view.findViewById(R.id.upload_history_list);
+         View listHeaderView = inflater.inflate(R.layout.fragment_contribute_logs_header, null);
+-        historyListView.addHeaderView(listHeaderView, null, false);
++        historyListView.addHeaderView(listHeaderView, null, true);
+         // TODO V2: Change the column name later (for history list items)
+         // the columns refer to the data that will be coming from the cursor and how it ties to the layout elements
+         String[] fromColumns = {PrivacyDB.COLUMN_COUNT, PrivacyDB.COLUMN_TIME};
+@@ -181,7 +182,7 @@ public class ContributeLogsFragment extends Fragment implements LoaderManager.Lo
+         historyListView.setAdapter(mAdapter);
+         getLoaderManager().initLoader(LOADER_CONTRIBUTE_LOGS, null, this);
+ 
+-        TextView uploadNow = (TextView) view.findViewById(R.id.upload_now);
++        Button uploadNow = (Button) view.findViewById(R.id.upload_now);
+         uploadNow.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeSettingsFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeSettingsFragment.java
+index bfb434c..87f20b0 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeSettingsFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/ContributeSettingsFragment.java
+@@ -30,6 +30,7 @@ import android.view.ViewGroup;
+ import android.widget.RadioButton;
+ import android.widget.RadioGroup;
+ import android.widget.TextView;
++import android.widget.Button;
+ 
+ import edu.uci.calit2.anteater.R;
+ import edu.uci.calit2.anteater.client.android.activity.AntMonitorMainActivity;
+@@ -107,7 +108,7 @@ public class ContributeSettingsFragment extends Fragment {
+             }
+         }
+ 
+-        TextView uploadNow = (TextView) view.findViewById(R.id.upload_now);
++        Button uploadNow = (Button) view.findViewById(R.id.upload_now);
+         uploadNow.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+@@ -126,7 +127,7 @@ public class ContributeSettingsFragment extends Fragment {
+             }
+         });
+ 
+-        TextView privacyTermsTextView = (TextView) view.findViewById(R.id.privacy_terms);
++        Button privacyTermsTextView = (Button) view.findViewById(R.id.privacy_terms);
+         privacyTermsTextView.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+@@ -143,7 +144,7 @@ public class ContributeSettingsFragment extends Fragment {
+             }
+         });
+ 
+-        TextView selectApplications = (TextView) view.findViewById(R.id.select_applications);
++        Button selectApplications = (Button) view.findViewById(R.id.select_applications);
+         selectApplications.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacyFiltersFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacyFiltersFragment.java
+index ba6bfc2..b634712 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacyFiltersFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacyFiltersFragment.java
+@@ -89,6 +89,14 @@ public class PrivacyFiltersFragment extends Fragment implements LoaderManager.Lo
+         super.onResume();
+         refreshPrivacyFilters();
+         LocalBroadcastManager.getInstance(getContext()).registerReceiver(privacyFiltersChangedReceiver, privacyFiltersFilter);
++         // try to set tls true again
++        View view = getView();
++        if (view != null) {
++            Switch tlsSwitch = (Switch) view.findViewById(R.id.tls_switch);
++            if (tlsSwitch != null && !tlsSwitch.isChecked()) {
++                tlsSwitch.setChecked(true);
++            }
++        }
+     }
+ 
+     public void onStop() {
+@@ -175,7 +183,7 @@ public class PrivacyFiltersFragment extends Fragment implements LoaderManager.Lo
+             // Set button state according to user prefs
+             SharedPreferences sp = getActivity().getSharedPreferences(PreferenceTags.PREFS_TAG,
+                     Context.MODE_PRIVATE);
+-            boolean sslEnabled = sp.getBoolean(PreferenceTags.PREFS_SSL_BUMPING, false);
++            boolean sslEnabled = sp.getBoolean(PreferenceTags.PREFS_SSL_BUMPING, true);
+             tlsSwitch.setChecked(sslEnabled);
+         }
+     }
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacySettingsFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacySettingsFragment.java
+index 2410b84..b456b4f 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacySettingsFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/PrivacySettingsFragment.java
+@@ -26,6 +26,7 @@ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
+ import android.widget.TextView;
++import android.widget.Button;
+ 
+ import edu.uci.calit2.anteater.R;
+ import edu.uci.calit2.anteater.client.android.activity.PrivacyFiltersActivity;
+@@ -71,7 +72,7 @@ public class PrivacySettingsFragment extends Fragment {
+         // Inflate the layout for this fragment
+         View view = inflater.inflate(R.layout.fragment_privacy_settings, container, false);
+ 
+-        TextView selectFilters = (TextView) view.findViewById(R.id.select_filters);
++        Button selectFilters = (Button) view.findViewById(R.id.select_filters);
+         selectFilters.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+@@ -81,7 +82,7 @@ public class PrivacySettingsFragment extends Fragment {
+             }
+         });
+ 
+-        TextView selectAppFilters = (TextView) view.findViewById(R.id.select_app_filters);
++        Button selectAppFilters = (Button) view.findViewById(R.id.select_app_filters);
+         selectAppFilters.setOnClickListener(new View.OnClickListener() {
+             @Override
+             public void onClick(View view) {
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/RealTimeFragment.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/RealTimeFragment.java
+index 7e0dfa5..bbe3fbe 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/RealTimeFragment.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/fragment/RealTimeFragment.java
+@@ -147,6 +147,7 @@ public class RealTimeFragment extends Fragment implements AdapterView.OnItemSele
+         super.onStart();
+         SharedPreferences sp = getContext().getSharedPreferences(PreferenceTags.PREFS_TAG, Context.MODE_PRIVATE);
+         boolean hasShownTutorial = sp.getBoolean(PreferenceTags.PREFS_REALTIME_OVERLAY_FIRST, false);
++        /* remove tutorial
+         if (!hasShownTutorial) {
+             sp.edit().putBoolean(PreferenceTags.PREFS_REALTIME_OVERLAY_FIRST, true).apply();
+             DialogFragment dialog = new RealTimeTutorialDialogOverlay();
+@@ -155,7 +156,7 @@ public class RealTimeFragment extends Fragment implements AdapterView.OnItemSele
+         webView.loadUrl("file:///android_asset/html/graph.html");
+         if (dropdown.getOnItemSelectedListener() == null) {
+             dropdown.setOnItemSelectedListener(this);
+-        }
++        }*/
+     }
+ 
+     public void onResume() {
+@@ -187,6 +188,7 @@ public class RealTimeFragment extends Fragment implements AdapterView.OnItemSele
+             @Override
+             public void onReceive(Context context, Intent intent) {
+                 // if the last time we had a data change was less than the visual update limit, then cancel it.
++                /*
+                 if (lastVisualDataChange != -1 && System.currentTimeMillis() - lastVisualDataChange < VISUAL_UPDATE_TIME_LIMIT) {
+                     updateVisualHandler.removeCallbacks(updateVisualRunnable);
+                 }
+@@ -211,6 +213,7 @@ public class RealTimeFragment extends Fragment implements AdapterView.OnItemSele
+ 
+                 lastVisualDataChange = System.currentTimeMillis();
+                 updateVisualHandler.postDelayed(updateVisualRunnable, VISUAL_UPDATE_TIME_LIMIT);
++                */
+             }
+         };
+ 
+diff --git a/app/src/main/java/edu/uci/calit2/anteater/client/android/util/UIHelper.java b/app/src/main/java/edu/uci/calit2/anteater/client/android/util/UIHelper.java
+index bda20a1..435406b 100644
+--- a/app/src/main/java/edu/uci/calit2/anteater/client/android/util/UIHelper.java
++++ b/app/src/main/java/edu/uci/calit2/anteater/client/android/util/UIHelper.java
+@@ -57,7 +57,7 @@ public class UIHelper {
+ 
+     public static int getDefaultContributionLevel(Context context) {
+         SharedPreferences sp = context.getSharedPreferences(PreferenceTags.PREFS_TAG, Context.MODE_PRIVATE);
+-        return sp.getInt(PreferenceTags.CONTRIBUTION_PREFS, R.id.low_contribute);
++        return sp.getInt(PreferenceTags.CONTRIBUTION_PREFS, R.id.high_contribute);
+     }
+ 
+     public static void setContributionLevel(Context context, int level) {
+diff --git a/app/src/main/res/layout/content_privacy_filters_header.xml b/app/src/main/res/layout/content_privacy_filters_header.xml
+index 66b836e..d90a5cc 100644
+--- a/app/src/main/res/layout/content_privacy_filters_header.xml
++++ b/app/src/main/res/layout/content_privacy_filters_header.xml
+@@ -63,7 +63,8 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:id="@+id/tls_switch"
+-                    android:layout_marginTop="15dp" />
++                    android:layout_marginTop="15dp"
++                    android:clickable="true" />
+             </LinearLayout>
+ 
+ 
+diff --git a/app/src/main/res/layout/fragment_contribute_logs_header.xml b/app/src/main/res/layout/fragment_contribute_logs_header.xml
+index 57152d3..dc88cbc 100644
+--- a/app/src/main/res/layout/fragment_contribute_logs_header.xml
++++ b/app/src/main/res/layout/fragment_contribute_logs_header.xml
+@@ -32,7 +32,7 @@
+                 android:layout_height="wrap_content"
+                 android:text="@string/upload_now_detail" />
+ 
+-            <TextView
++            <Button
+                 android:text="@string/upload_now"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+diff --git a/app/src/main/res/layout/fragment_contribute_settings.xml b/app/src/main/res/layout/fragment_contribute_settings.xml
+index a88f448..4f280f9 100644
+--- a/app/src/main/res/layout/fragment_contribute_settings.xml
++++ b/app/src/main/res/layout/fragment_contribute_settings.xml
+@@ -38,19 +38,19 @@
+                 android:layout_height="wrap_content"
+                 android:text="@string/upload_now_detail" />
+ 
+-            <TextView
++            <Button
+                 android:text="@string/upload_now"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:id="@+id/upload_now"
+-                android:textColor="@color/black"
+                 android:clickable="true"
+                 android:textIsSelectable="false"
+                 android:textSize="14sp"
+                 android:gravity="center_vertical"
+                 android:paddingTop="20dp"
+                 android:paddingBottom="20dp"
+-                android:background="@drawable/label_bg"/>
++                android:textColor="@color/common_signin_btn_dark_text_default"
++                android:backgroundTint="@color/accent" />
+ 
+             <include layout="@layout/content_contribution_level"/>
+ 
+@@ -63,33 +63,34 @@
+                 android:layout_marginBottom="5dp" />
+             <include layout="@layout/horizontal_line_3"/>
+ 
+-            <TextView
++            <Button
+                 android:text="@string/contribute_setting_select_applications"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:id="@+id/select_applications"
+-                android:textColor="@color/black"
+                 android:clickable="true"
+                 android:textIsSelectable="false"
+                 android:paddingTop="20dp"
+                 android:paddingBottom="20dp"
+                 android:gravity="center_vertical"
+-                android:background="@drawable/label_bg"/>
++                android:textColor="@color/common_signin_btn_dark_text_default"
++                android:backgroundTint="@color/accent"/>
+ 
+             <include layout="@layout/horizontal_line_2"/>
+ 
+-            <TextView
++            <Button
+                 android:text="@string/contribute_privacy_terms"
+                 android:id="@+id/privacy_terms"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+-                android:textColor="@color/black"
+                 android:clickable="true"
+                 android:textIsSelectable="false"
+                 android:paddingTop="20dp"
+                 android:paddingBottom="20dp"
+                 android:gravity="center_vertical"
+-                android:background="@drawable/label_bg"/>
++                android:contextClickable="true"
++                android:textColor="@color/common_signin_btn_dark_text_default"
++                android:backgroundTint="@color/accent" />
+ 
+             <include layout="@layout/horizontal_line_2"/>
+ 
+diff --git a/app/src/main/res/layout/fragment_privacy_settings.xml b/app/src/main/res/layout/fragment_privacy_settings.xml
+index 33a8c92..f768669 100644
+--- a/app/src/main/res/layout/fragment_privacy_settings.xml
++++ b/app/src/main/res/layout/fragment_privacy_settings.xml
+@@ -32,31 +32,33 @@
+             android:orientation="vertical"
+             android:padding="15dp">
+ 
+-            <TextView
++            <Button
+                 android:text="@string/privacy_filters_global_select"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:id="@+id/select_filters"
+-                android:textColor="@color/black"
+                 android:clickable="true"
+                 android:textIsSelectable="false"
+                 android:paddingTop="20dp"
+                 android:paddingBottom="20dp"
+-                android:background="@drawable/label_bg"/>
++                android:background="@drawable/label_bg"
++                android:textColor="@color/common_signin_btn_dark_text_default"
++                android:backgroundTint="@color/accent"/>
+ 
+             <include layout="@layout/horizontal_line_2"/>
+ 
+-            <TextView
++            <Button
+                 android:text="@string/privacy_filters_app_specific_select"
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:id="@+id/select_app_filters"
+-                android:textColor="@color/black"
+                 android:clickable="true"
+                 android:textIsSelectable="false"
+                 android:paddingTop="20dp"
+                 android:paddingBottom="20dp"
+-                android:background="@drawable/label_bg"/>
++                android:background="@drawable/label_bg"
++                android:textColor="@color/common_signin_btn_dark_text_default"
++                android:backgroundTint="@color/accent"/>
+ 
+             <include layout="@layout/horizontal_line_2"/>
+ 

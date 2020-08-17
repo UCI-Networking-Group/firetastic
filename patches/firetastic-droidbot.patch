@@ -1,0 +1,389 @@
+diff --git a/droidbot/adapter/droidbot_app.py b/droidbot/adapter/droidbot_app.py
+index 776fdc5..29dad61 100644
+--- a/droidbot/adapter/droidbot_app.py
++++ b/droidbot/adapter/droidbot_app.py
+@@ -143,14 +143,20 @@ class DroidBotAppConn(Adapter):
+                     message = message.decode()
+                 self.handle_message(message)
+             print("[CONNECTION] %s is disconnected" % self.__class__.__name__)
+-        except Exception:
++        except Exception as e:
+             if self.check_connectivity():
+                 traceback.print_exc()
+                 # clear self.last_acc_event
+-                self.logger.warning("Restarting droidbot app")
+                 self.last_acc_event = None
+                 self.disconnect()
+                 self.connect()
++                # do not reconnect if device has been disconnected
++                #if self.device and self.device.adb.check_connectivity() and self.connected:
++                #    self.logger.warning("Restarting droidbot app")
++                #    self.connect()
++                #else:
++                #    print("Error with connectivity, raising exception")
++                #    raise e
+ 
+     def handle_message(self, message):
+         acc_event_idx = message.find("AccEvent >>> ")
+@@ -187,12 +193,14 @@ class DroidBotAppConn(Adapter):
+             try:
+                 self.sock.close()
+             except Exception as e:
++                print("Could not close socket")
+                 print(e)
+         try:
+             forward_remove_cmd = "adb -s %s forward --remove tcp:%d" % (self.device.serial, self.port)
+             p = subprocess.Popen(forward_remove_cmd.split(), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+             out, err = p.communicate()
+         except Exception as e:
++            print("Could not disconnect from device")
+             print(e)
+         self.__can_wait = False
+ 
+diff --git a/droidbot/app.py b/droidbot/app.py
+index fa98130..2d6ab85 100644
+--- a/droidbot/app.py
++++ b/droidbot/app.py
+@@ -48,7 +48,10 @@ class App(object):
+         :return:
+         """
+         if self.main_activity is not None:
+-            return self.main_activity
++            if self.main_activity != self.dumpsys_main_activity and "tv." in self.dumpsys_main_activity:
++                self.logger.info("opting for tv activity in instead of main_activity in manifest")
++                return self.dumpsys_main_activity
++            return self.main_activity.replace("..", ".")
+         else:
+             self.logger.warning("Cannot get main activity from manifest. Using dumpsys result instead.")
+             return self.dumpsys_main_activity
+diff --git a/droidbot/device.py b/droidbot/device.py
+index a1d2345..1c06570 100644
+--- a/droidbot/device.py
++++ b/droidbot/device.py
+@@ -4,6 +4,7 @@ import re
+ import subprocess
+ import sys
+ import time
++from threading import Timer
+ 
+ from .adapter.adb import ADB
+ from .adapter.droidbot_app import DroidBotAppConn
+@@ -18,6 +19,7 @@ from .intent import Intent
+ 
+ DEFAULT_NUM = '1234567890'
+ DEFAULT_CONTENT = 'Hello world!'
++DEFAULT_INSTALL_TIMEOUT = -1
+ 
+ 
+ class Device(object):
+@@ -27,7 +29,8 @@ class Device(object):
+ 
+     def __init__(self, device_serial=None, is_emulator=False, output_dir=None,
+                  cv_mode=False, grant_perm=False, telnet_auth_token=None,
+-                 enable_accessibility_hard=False, humanoid=None, ignore_ad=False):
++                 enable_accessibility_hard=False, humanoid=None, ignore_ad=False,
++                 install_timeout=None):
+         """
+         initialize a device connection
+         :param device_serial: serial number of target device
+@@ -56,6 +59,9 @@ class Device(object):
+         self.enable_accessibility_hard = enable_accessibility_hard
+         self.humanoid = humanoid
+         self.ignore_ad = ignore_ad
++        self.install_timeout = install_timeout
++        self.should_timeout_install = False
++        self.timer = None
+ 
+         # basic device information
+         self.settings = {}
+@@ -493,6 +499,7 @@ class Device(object):
+             package_name = app.get_package_name()
+             if app.get_main_activity():
+                 package_name += "/%s" % app.get_main_activity()
++                package_name = package_name.replace("..", ".")
+         else:
+             self.logger.warning("unsupported param " + app + " with type: ", type(app))
+             return
+@@ -614,17 +621,34 @@ class Device(object):
+         #                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+         package_name = app.get_package_name()
+         if package_name not in self.adb.get_installed_apps():
++            # reset the timeout install state
++            self.should_timeout_install = False
++            if self.install_timeout > 0:
++                self.timer = Timer(self.install_timeout, self._force_timeout_install)
++
+             install_cmd = ["adb", "-s", self.serial, "install", "-r"]
+             if self.grant_perm and self.get_sdk_version() >= 23:
+                 install_cmd.append("-g")
+             install_cmd.append(app.app_path)
+             install_p = subprocess.Popen(install_cmd, stdout=subprocess.PIPE)
+-            while self.connected and package_name not in self.adb.get_installed_apps():
++            if self.timer:
++                self.timer.start()
++
++            while self.connected and package_name not in self.adb.get_installed_apps() and not self.should_timeout_install:
+                 print("Please wait while installing the app...")
+                 time.sleep(2)
+             if not self.connected:
+                 install_p.terminate()
++                self._terminate_install_timer()
+                 return
++            if self.should_timeout_install:
++                print("Installing the app has timed out...")
++                self._terminate_install_timer()
++                install_p.terminate()
++                return
++
++        # once we get here, it means the timer no longer needed
++        self._terminate_install_timer()
+ 
+         dumpsys_p = subprocess.Popen(["adb", "-s", self.serial, "shell",
+                                       "dumpsys", "package", package_name], stdout=subprocess.PIPE)
+@@ -642,10 +666,50 @@ class Device(object):
+             package_info_file.writelines(dumpsys_lines)
+             package_info_file.close()
+         app.dumpsys_main_activity = self.__parse_main_activity_from_dumpsys_lines(dumpsys_lines)
++        self.logger.info("dumpsys main activity found %s" % str(app.dumpsys_main_activity))
++        if app.dumpsys_main_activity is None:
++            app.dumpsys_main_activity = self.__parse_main_activity_from_dumpsys_lines_firetv(dumpsys_lines)
++            self.logger.info("dumpsys main activity (second try) found %s" % str(app.dumpsys_main_activity))
+ 
+         self.logger.info("App installed: %s" % package_name)
+         self.logger.info("Main activity: %s" % app.get_main_activity())
+ 
++    def _force_timeout_install(self):
++        self.should_timeout_install = True
++
++    def _terminate_install_timer(self):
++        if self.timer and self.timer.isAlive():
++            self.timer.cancel()
++
++    @staticmethod
++    def __parse_main_activity_from_dumpsys_lines_firetv(lines):
++        activity_next_line = False
++        main_activity = None
++        for line in lines:
++            if "android.intent" in line and "MAIN" not in line:
++                print("done parsing activity")
++                break
++            #print(line)
++            if activity_next_line:
++                split_line = line.strip().split(" ")
++                for split_line_tmp in split_line:
++                    if main_activity is None:
++                        if "activity" in split_line_tmp.lower():
++                            main_activity = split_line_tmp.rstrip()
++                    elif "activity" in split_line_tmp.lower() and "tv." in split_line_tmp.lower():
++                        main_activity = split_line_tmp.rstrip()
++                        print("opting for tv activity")
++            if "android.intent.action.MAIN" in line:
++                activity_next_line = True
++            
++
++        if main_activity:
++            # current str is [package]/[activity]
++            split_act = main_activity.split("/")
++            if len(split_act) == 2:
++                return split_act[1]
++
++
+     @staticmethod
+     def __parse_main_activity_from_dumpsys_lines(lines):
+         main_activity = None
+@@ -712,6 +776,13 @@ class Device(object):
+                 time.sleep(2)
+             uninstall_p.terminate()
+ 
++    def is_app_installed(self, app):
++        if isinstance(app, App):
++            package_name = app.get_package_name()
++        else:
++            package_name = app
++        return package_name in self.adb.get_installed_apps()
++
+     def get_app_pid(self, app):
+         if isinstance(app, App):
+             package = app.get_package_name()
+@@ -906,3 +977,6 @@ class Device(object):
+         if self.minicap.check_connectivity():
+             print("[CONNECTION] %s is reconnected." % self.minicap.__class__.__name__)
+         self.pause_sending_event = False
++
++class InstallTimeoutException (Exception):
++    pass
+\ No newline at end of file
+diff --git a/droidbot/device_state.py b/droidbot/device_state.py
+index 7a8579f..c0efe10 100644
+--- a/droidbot/device_state.py
++++ b/droidbot/device_state.py
+@@ -61,8 +61,9 @@ class DeviceState(object):
+ 
+     def __assemble_view_tree(self, root_view, views):
+         if not len(self.view_tree): # bootstrap
+-            self.view_tree = copy.deepcopy(views[0])
+-            self.__assemble_view_tree(self.view_tree, views)
++            if views and len(views) > 0:
++                self.view_tree = copy.deepcopy(views[0])
++                self.__assemble_view_tree(self.view_tree, views)
+         else:
+             children = list(enumerate(root_view["children"]))
+             if not len(children):
+diff --git a/droidbot/droidbot.py b/droidbot/droidbot.py
+index d8f8f95..ba7d1e5 100644
+--- a/droidbot/droidbot.py
++++ b/droidbot/droidbot.py
+@@ -10,6 +10,7 @@ import shutil
+ from threading import Timer
+ 
+ from .device import Device
++from .device import InstallTimeoutException
+ from .app import App
+ from .env_manager import AppEnvManager
+ from .input_manager import InputManager
+@@ -44,7 +45,8 @@ class DroidBot(object):
+                  master=None,
+                  humanoid=None,
+                  ignore_ad=False,
+-                 replay_output=None):
++                 replay_output=None,
++                 install_timeout=None):
+         """
+         initiate droidbot with configurations
+         :return:
+@@ -80,6 +82,7 @@ class DroidBot(object):
+         self.humanoid = humanoid
+         self.ignore_ad = ignore_ad
+         self.replay_output = replay_output
++        self.install_timeout = install_timeout
+ 
+         self.enabled = True
+ 
+@@ -92,7 +95,8 @@ class DroidBot(object):
+                 grant_perm=grant_perm,
+                 enable_accessibility_hard=self.enable_accessibility_hard,
+                 humanoid=self.humanoid,
+-                ignore_ad=ignore_ad)
++                ignore_ad=ignore_ad,
++                install_timeout=self.install_timeout)
+             self.app = App(app_path, output_dir=self.output_dir)
+ 
+             self.env_manager = AppEnvManager(
+@@ -132,9 +136,6 @@ class DroidBot(object):
+             return
+         self.logger.info("Starting DroidBot")
+         try:
+-            if self.timeout > 0:
+-                self.timer = Timer(self.timeout, self.stop)
+-                self.timer.start()
+ 
+             self.device.set_up()
+ 
+@@ -146,10 +147,18 @@ class DroidBot(object):
+                 return
+             self.device.install_app(self.app)
+ 
++            # if app has not installed, return
++            if not self.device.is_app_installed(self.app):
++                raise InstallTimeoutException()
++
+             if not self.enabled:
+                 return
+             self.env_manager.deploy()
+ 
++            if self.timeout > 0:
++                self.timer = Timer(self.timeout, self.stop)
++                self.timer.start()
++
+             if not self.enabled:
+                 return
+             if self.droidbox is not None:
+@@ -163,6 +172,9 @@ class DroidBot(object):
+         except KeyboardInterrupt:
+             self.logger.info("Keyboard interrupt.")
+             pass
++        except InstallTimeoutException:
++            self.logger.info("Install timeout.")
++            pass
+         except Exception:
+             import traceback
+             traceback.print_exc()
+diff --git a/droidbot/input_event.py b/droidbot/input_event.py
+index e3eaa99..a44a3ad 100644
+--- a/droidbot/input_event.py
++++ b/droidbot/input_event.py
+@@ -231,6 +231,11 @@ class EventLog(object):
+         self.event_str = self.event.get_event_str(self.from_state)
+         print("Input: %s" % self.event_str)
+         self.device.send_event(self.event)
++        if self.is_start_event():
++            sleep_for = 15
++            print("Just sent start event: pausing for a bit: " + str(sleep_for))
++            # sleep to allow app to start
++            time.sleep(sleep_for)
+ 
+     def start_profiling(self):
+         """
+diff --git a/droidbot/input_policy.py b/droidbot/input_policy.py
+index 356f6e2..87da4b3 100644
+--- a/droidbot/input_policy.py
++++ b/droidbot/input_policy.py
+@@ -195,7 +195,7 @@ class UtgNaiveSearchPolicy(UtgBasedInputPolicy):
+     """
+ 
+     def __init__(self, device, app, random_input, search_method):
+-        super(UtgNaiveSearchPolicy, self).__init__(device, app, random_input)
++        super(UtgNaiveSearchPolicy, self).__init__(device, app, True)
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+         self.explored_views = set()
+@@ -431,8 +431,10 @@ class UtgGreedySearchPolicy(UtgBasedInputPolicy):
+             random.shuffle(possible_events)
+ 
+         if self.search_method == POLICY_GREEDY_DFS:
++            self.logger.info("Inserting BACK event to end of possible_events")
+             possible_events.append(KeyEvent(name="BACK"))
+         elif self.search_method == POLICY_GREEDY_BFS:
++            self.logger.info("Inserting BACK event to beginning of possible_events")
+             possible_events.insert(0, KeyEvent(name="BACK"))
+ 
+         # get humanoid result, use the result to sort possible events
+@@ -444,6 +446,7 @@ class UtgGreedySearchPolicy(UtgBasedInputPolicy):
+         for input_event in possible_events:
+             if not self.utg.is_event_explored(event=input_event, state=current_state):
+                 self.logger.info("Trying an unexplored event.")
++                self.logger.info(str(input_event))
+                 self.__event_trace += EVENT_FLAG_EXPLORE
+                 return input_event
+ 
+diff --git a/droidbot/start.py b/droidbot/start.py
+index 873bbe6..21689e0 100644
+--- a/droidbot/start.py
++++ b/droidbot/start.py
+@@ -4,6 +4,7 @@ import argparse
+ from . import input_manager
+ from . import input_policy
+ from . import env_manager
++from . import device
+ from .droidbot import DroidBot
+ from .droidmaster import DroidMaster
+ 
+@@ -89,6 +90,8 @@ def parse_args():
+                         help="Ignore Ad views by checking resource_id.")
+     parser.add_argument("-replay_output", action="store", dest="replay_output",
+                         help="The droidbot output directory being replayed.")
++    parser.add_argument("-install_timeout", action="store", dest="install_timeout", default=device.DEFAULT_INSTALL_TIMEOUT, type=int,
++                        help="Timeout in seconds, -1 means unlimited. Default: %d" % device.DEFAULT_INSTALL_TIMEOUT)
+     options = parser.parse_args()
+     # print options
+     return options
+@@ -165,7 +168,8 @@ def main():
+             master=opts.master,
+             humanoid=opts.humanoid,
+             ignore_ad=opts.ignore_ad,
+-            replay_output=opts.replay_output)
++            replay_output=opts.replay_output,
++            install_timeout=opts.install_timeout)
+         droidbot.start()
+     return
+ 
